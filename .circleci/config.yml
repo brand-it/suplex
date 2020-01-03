@@ -1,0 +1,120 @@
+# Ruby CircleCI 2.0 configuration file
+#
+# Check https://circleci.com/docs/2.0/language-ruby/ for more details
+#
+version: 2
+
+environment: &environment
+  DB_USERNAME: postgres
+  RAILS_ENV: test
+  NODE_ENV: test
+  DB_HOST: 127.0.0.1
+
+defaults: &defaults
+  working_directory: ~/repo
+  environment:
+    <<: *environment
+  docker:
+    - image: circleci/ruby:2.5.3-node-browsers
+    - image: circleci/postgres:9.6.2-alpine
+jobs:
+  setup:
+    <<: *defaults
+    steps:
+      - run:
+          name:  Download cc-test-reporter
+          command: |
+            mkdir -p tmp/
+            curl -L https://codeclimate.com/downloads/test-reporter/test-reporter-latest-linux-amd64 > ./tmp/cc-test-reporter
+            chmod +x ./tmp/cc-test-reporter
+
+      - persist_to_workspace:
+          root: tmp
+          paths:
+            - cc-test-reporter
+  rspec:
+    <<: *defaults
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/repo/tmp
+      # Download and cache dependencies
+      - restore_cache:
+          name: Restore Rails Gems
+          keys:
+            - gem-cache-v1-{{ arch }}-{{ .Branch }}-{{ checksum "Gemfile.lock" }}
+            # fallback to using the latest cache if no exact match is found
+            - gem
+      - run:
+          name: install dependencies
+          command: bundle check --path=vendor/bundle || bundle install --path=vendor/bundle --jobs=4 --retry=3
+      - save_cache:
+          name: Save Rails Gems
+          key: gem-cache-v1-{{ arch }}-{{ .Branch }}-{{ checksum "Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+      - restore_cache:
+          name: Restore YARN Packages
+          keys:
+            - yarn-packages-{{ checksum "yarn.lock" }}
+            # fallback to using the latest cache if no exact match is found
+            - yarn
+      - run:
+          name: Installing Yarn
+          command: yarn install --cache-folder tmp/yarn
+      - save_cache:
+          name: Save YARN Packages
+          key: yarn-packages-{{ checksum "yarn.lock" }}
+          paths:
+            - tmp/yarn
+            - node_modules
+      - run:
+          name: Create Database
+          command: bundle exec rake db:setup
+      - run:
+          name: Precomple Webpack Stuff
+          command: bundle exec rails webpacker:compile
+      - run:
+          name: run tests
+          command: |
+            mkdir ./tmp/test-results
+            TEST_FILES="$(circleci tests glob "spec/**/*_spec.rb" | circleci tests split --split-by=timings)"
+
+            bundle exec rspec --format progress \
+                            --format RspecJunitFormatter \
+                            --out ./tmp/test-results/rspec.xml \
+                            --format progress \
+                            $TEST_FILES
+      - run:
+          name: format simple cov
+          command: |
+            ./tmp/cc-test-reporter format-coverage -t simplecov -o tmp/codeclimate.rspec.json coverage/backend/.resultset.json
+      - persist_to_workspace:
+          root: tmp
+          paths:
+            - codeclimate.rspec.json
+
+  deploy:
+    docker:
+      - image: buildpack-deps:trusty
+    steps:
+      - checkout
+      - run:
+          name: Deploy Master to Heroku
+          command: |
+            git push https://heroku:$HEROKU_API_KEY@git.heroku.com/$HEROKU_APP_NAME.git master
+workflows:
+  version: 2
+  code_change:
+    jobs:
+      - setup
+      - rspec:
+          requires:
+            - setup
+      - deploy:
+          filters:
+            branches:
+              only:
+                - master
+          requires:
+            - rspec
